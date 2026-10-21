@@ -1,0 +1,178 @@
+"""Typed Master Planner with deterministic composite plans."""
+
+from __future__ import annotations
+
+import json
+from pydantic import ValidationError
+
+from ...config.constants import AGENT_EXEC, AGENT_QUERY, AGENT_RAG
+from ...config.settings import settings
+from ...core.llm import is_llm_configured, llm_chat_structured, resolve_mode
+from .policy import (
+    MasterPlanValidationError,
+    is_composite_analysis,
+    is_composite_customer_reply,
+    validate_master_plan,
+)
+from .prompts import PLANNER_SYSTEM_PROMPT
+from .schemas import MasterPlan, PlanStep
+from .telemetry import MasterLLMTelemetry
+from ...platform.observability.context import trace_context
+
+
+def _query(task_input: dict) -> str:
+    return str(
+        task_input.get("query") or task_input.get("user_query") or task_input.get("text") or ""
+    ).strip()
+
+
+def rewrite_composite_queries(query: str) -> tuple[str, str]:
+    """Bounded deterministic split; simple RAG and SQL requests are never rewritten."""
+    lowered = query.lower()
+    if "退款" in query or "refund" in lowered:
+        return (
+            f"{query} | monthly refund rate trend by SKU and category",
+            f"{query} | refund policy changes shipping incidents complaints operations notes",
+        )
+    return (
+        f"{query} | metric trend and segment contribution",
+        f"{query} | policy and operations context",
+    )
+
+
+def build_composite_plan(task_input: dict) -> MasterPlan | None:
+    """订单事实 + 政策知识 → CRM 回复的高置信 DAG 模板。"""
+    query = _query(task_input)
+    if is_composite_analysis(query):
+        sql_query, rag_query = rewrite_composite_queries(query)
+        return validate_master_plan(
+            MasterPlan(
+                decision="execute",
+                confidence=0.98,
+                reason_code="COMPOSITE_DATA_ANALYSIS",
+                planner_source="rules_composite",
+                steps=[
+                    PlanStep(
+                        step_id="structured_analysis",
+                        agent=AGENT_QUERY,
+                        task_type="data_analysis",
+                        payload={"query": sql_query, "original_query": query},
+                    ),
+                    PlanStep(
+                        step_id="document_context",
+                        agent=AGENT_RAG,
+                        task_type="knowledge_qa",
+                        payload={"query": rag_query, "original_query": query},
+                    ),
+                ],
+            )
+        )
+    if not is_composite_customer_reply(query):
+        return None
+    plan = MasterPlan(
+        decision="execute",
+        confidence=0.98,
+        reason_code="COMPOSITE_CUSTOMER_REPLY",
+        planner_source="rules_composite",
+        steps=[
+            PlanStep(
+                step_id="order_context",
+                agent=AGENT_QUERY,
+                task_type="order_query",
+                payload={"query": query},
+            ),
+            PlanStep(
+                step_id="policy_context",
+                agent=AGENT_RAG,
+                task_type="knowledge_qa",
+                payload={"query": query},
+            ),
+            PlanStep(
+                step_id="customer_reply",
+                agent=AGENT_EXEC,
+                task_type="customer_service",
+                depends_on=["order_context", "policy_context"],
+                payload={"query": query},
+            ),
+        ],
+    )
+    return validate_master_plan(plan)
+
+
+def _clarify(reason_code: str, question: str) -> MasterPlan:
+    return MasterPlan(
+        decision="clarify",
+        confidence=0.2,
+        reason_code=reason_code,
+        clarification_question=question,
+        planner_source="deterministic_fallback",
+        steps=[],
+    )
+
+
+class TypedMasterPlanner:
+    async def plan(
+        self,
+        task_input: dict,
+        telemetry: MasterLLMTelemetry,
+    ) -> MasterPlan:
+        composite = build_composite_plan(task_input)
+        if composite is not None:
+            return composite
+        if not is_llm_configured():
+            return _clarify(
+                "UNKNOWN_NO_LLM",
+                "请补充需要组合查询、知识检索或业务执行的具体目标。",
+            )
+        if not telemetry.start_call("planner"):
+            return _clarify(
+                "LLM_BUDGET_EXCEEDED",
+                "当前复杂规划预算已用尽，请缩小请求范围后重试。",
+            )
+
+        recovery_context = task_input.get("_recovery_context")
+        recovery_block = ""
+        if isinstance(recovery_context, dict):
+            recovery_block = (
+                "\nCompact recovery context:\n"
+                f"{json.dumps(recovery_context, ensure_ascii=False, default=str)[:1800]}\n"
+            )
+        prompt = (
+            f"User request:\n{_query(task_input)[:1200]}\n"
+            f"{recovery_block}\nReturn a validated dependency plan."
+        )
+        try:
+            with trace_context(workflow="planner"):
+                structured = await llm_chat_structured(
+                    response_model=MasterPlan,
+                    defaults={"planner_source": "llm"},
+                    repair_attempts=0,
+                    user_prompt=prompt,
+                    system_prompt=PLANNER_SYSTEM_PROMPT,
+                    temperature=0.1,
+                    max_tokens=int(settings.MASTER_PLAN_MAX_TOKENS),
+                    mode=resolve_mode(settings.MASTER_PLAN_MODE),
+                )
+            telemetry.add_result("planner", structured.response)
+            return validate_master_plan(structured.value)
+        except (ValidationError, MasterPlanValidationError, TypeError, ValueError):
+            return _clarify(
+                "INVALID_LLM_PLAN",
+                "复杂请求的执行计划未通过安全校验，请补充或简化需求。",
+            )
+        except Exception:
+            return _clarify(
+                "PLANNER_PROVIDER_ERROR",
+                "复杂规划服务暂不可用，请稍后重试或简化需求。",
+            )
+
+
+typed_master_planner = TypedMasterPlanner()
+
+
+__all__ = [
+    "TypedMasterPlanner",
+    "build_composite_plan",
+    "rewrite_composite_queries",
+    "typed_master_planner",
+]

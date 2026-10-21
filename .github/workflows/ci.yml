@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      APP_ENV: test
+      AUTH_MODE: api_key
+      API_KEY: test-only-key
+      ECOM_DOWNLOAD_RERANKER: "0"
+      PYTHONPATH: .
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+
+      - name: Install runtime and development dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compile Python sources
+        run: python -m compileall -q ecom_agent_matrix eval
+
+      - name: Ruff checks
+        run: ruff check ecom_agent_matrix test eval
+
+      - name: Ruff formatting
+        run: ruff format --check ecom_agent_matrix test eval
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run deterministic Agent evaluation
+        run: python -m eval.runner --suite deterministic --fail-on-regression
+
+      - name: Run Enterprise Data Agent benchmark
+        run: python -m eval.enterprise.runner --suite all --fail-on-regression
+
+      - name: Run advanced deterministic enterprise benchmarks
+        run: python -m eval.enterprise.advanced_runner --suite all --fail-on-regression
+
+  enterprise-sql-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      APP_ENV: test
+      PYTHONPATH: .
+      PG_HOST: 127.0.0.1
+      PG_PORT: 5432
+      PG_USER: postgres
+      PG_PWD: postgres
+      PG_DB: ecom_matrix
+      PG_READ_USER: ecom_eval_read
+      PG_READ_PWD: eval_read_password
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ecom_matrix
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ecom_matrix"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run Gold SQL execution benchmark
+        run: >-
+          python -m eval.enterprise.live_sql.runner
+          --require-postgres --fail-on-regression
+
+      - name: Run deterministic question-to-SQL benchmark
+        if: always()
+        run: >-
+          python -m eval.enterprise.live_sql.text_to_sql_runner
+          --require-postgres --fail-on-regression
+
+      - name: Run PostgreSQL schema, RLS, read-only and analytical benchmark
+        if: always()
+        run: >-
+          python -m eval.enterprise.live_sql.db_integration_runner
+          --require-postgres --fail-on-regression
+
+      - name: Upload enterprise SQL reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: enterprise-sql-reports
+          if-no-files-found: warn
+          path: |
+            eval/enterprise/results/sql_gold_execution.json
+            eval/enterprise/results/text_to_sql_execution.json
+            eval/enterprise/results/db_security.json

@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Northstar AI 电商运营助手 | Ecom Agent Console</title>
+  <link rel="stylesheet" href="/app/static/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">EA</div>
+        <div>
+          <h1>Northstar AI</h1>
+          <p>电商运营助手</p>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Console sections">
+        <button class="nav-item active" data-view="task">智能对话</button>
+        <button class="nav-item" data-view="customer">客服 / RAG</button>
+        <button class="nav-item" data-view="competitor">竞品监控</button>
+        <button class="nav-item" data-view="approval">人工审批</button>
+        <button class="nav-item" data-view="system">系统状态</button>
+        <button class="nav-item admin-nav" data-view="admin">管理员</button>
+      </nav>
+
+      <div class="auth-card">
+        <div class="section-kicker">Authentication</div>
+        <label>
+          模式
+          <select id="authMode">
+            <option value="api_key">X-API-Key</option>
+            <option value="jwt">JWT Bearer</option>
+          </select>
+        </label>
+        <label>
+          Credential
+          <input id="credential" type="password" autocomplete="off" placeholder="仅保存在当前标签页" />
+        </label>
+        <button id="saveCredential" class="button secondary">应用凭证</button>
+        <p class="hint">凭证仅写入 sessionStorage，不持久化到磁盘。</p>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <span class="eyebrow">Runtime console</span>
+          <h2 id="viewTitle">智能运营对话</h2>
+        </div>
+        <div class="health-row">
+          <span id="healthDot" class="dot unknown"></span>
+          <span id="healthText">未检查</span>
+          <button id="checkHealth" class="button ghost">检查状态</button>
+        </div>
+      </header>
+
+      <section id="taskView" class="view active">
+        <div class="chat-layout">
+          <section class="panel chat-panel">
+            <div class="panel-head">
+              <div>
+                <span class="section-kicker">Natural language</span>
+                <h3>你想了解或完成什么？</h3>
+              </div>
+              <button id="loadPreset" class="button ghost">载入示例</button>
+            </div>
+
+            <div id="conversation" class="conversation">
+              <div class="message assistant">你好，我可以查数据、搜知识、看库存和竞品，也能生成文案与需审批的操作。</div>
+            </div>
+            <p id="conversationState" class="hint">已开启短期记忆；点击“新对话”会清空本轮记录与记忆。</p>
+
+            <label class="chat-input-label">
+              <span class="sr-only">自然语言请求</span>
+              <textarea id="taskQuery" rows="4" placeholder="直接描述你想完成的任务，例如：为什么8月退款率上涨？"></textarea>
+            </label>
+            <div class="actions chat-actions">
+              <button id="sendTask" class="button primary">发送</button>
+              <button id="clearTask" class="button secondary">新对话</button>
+            </div>
+
+            <details class="advanced">
+              <summary>高级 / 开发者选项</summary>
+              <label>
+              Task Type（建议保持自动识别）
+              <select id="taskType">
+                <option value="">自动识别</option>
+                <option>data_analysis</option>
+                <option>knowledge_qa</option>
+                <option>goods_search</option>
+                <option>goods_catalog</option>
+                <option>stock_analysis</option>
+                <option>competitor_watch</option>
+                <option>order_query</option>
+                <option>ad_query</option>
+                <option>ad_optimize</option>
+                <option>data_check</option>
+                <option>ops_report</option>
+                <option>social_marketing</option>
+                <option>customer_service</option>
+                <option>risk_control</option>
+              </select>
+            </label>
+
+            <div class="grid two compact">
+              <label>
+                Priority
+                <select id="priority">
+                  <option value="">默认</option>
+                  <option value="0">0 - highest</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4 - lowest</option>
+                </select>
+              </label>
+              <label>
+                Timeout (s)
+                <input id="taskTimeout" type="number" min="0" step="0.5" placeholder="默认" />
+              </label>
+            </div>
+
+            <label>
+              Payload JSON
+              <textarea id="taskPayload" class="code-input" rows="8">{}</textarea>
+            </label>
+
+            <label>
+              Approval ID（批准后重试写操作时使用）
+              <input id="taskApprovalId" placeholder="可选" />
+            </label>
+
+            </details>
+          </section>
+
+          <section class="panel">
+            <span class="section-kicker">Capabilities</span>
+            <h3>试试这些问题</h3>
+            <div id="capabilityGrid" class="capability-grid"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="customerView" class="view">
+        <section class="panel">
+          <span class="section-kicker">RAG / order query</span>
+          <h3>/api/v1/customer/chat</h3>
+          <label>
+            Query
+            <textarea id="customerQuery" rows="5" placeholder="例如：退款政策是什么？"></textarea>
+          </label>
+          <div class="grid three compact">
+            <label>Language<input id="customerLang" value="zh" /></label>
+            <label>Session ID<input id="sessionId" placeholder="sess-demo-001" /></label>
+            <label>Order No<input id="orderNo" placeholder="可选" /></label>
+          </div>
+          <div class="toggle-row">
+            <label class="check"><input id="useRag" type="checkbox" checked /> 使用 RAG</label>
+            <label class="check"><input id="useTaobao" type="checkbox" /> 使用订单查询路径</label>
+          </div>
+          <button id="sendCustomer" class="button primary">发送</button>
+        </section>
+      </section>
+
+      <section id="competitorView" class="view">
+        <section class="panel">
+          <span class="section-kicker">Competitor workflow</span>
+          <h3>/api/v1/warn/competitor</h3>
+          <div class="grid two compact">
+            <label>SKU<input id="competitorSku" placeholder="SKU-BAG-001" /></label>
+            <label>Competitor<input id="competitorName" placeholder="Temu" /></label>
+          </div>
+          <div class="grid two compact">
+            <label>Observed price<input id="competitorPrice" type="number" step="0.01" /></label>
+            <label>Timeout<input id="competitorTimeout" type="number" step="0.5" /></label>
+          </div>
+          <label>
+            Query
+            <textarea id="competitorQuery" rows="4" placeholder="监控 Temu 上 SKU-BAG-001 的价格"></textarea>
+          </label>
+          <label class="check"><input id="viaMaster" type="checkbox" checked /> 通过 Master</label>
+          <button id="sendCompetitor" class="button primary">执行</button>
+        </section>
+      </section>
+
+      <section id="approvalView" class="view">
+        <section class="panel">
+          <span class="section-kicker">Human in the loop</span>
+          <h3>高风险操作审批</h3>
+          <p class="muted">当任务返回 <code>APPROVAL_REQUIRED</code> 时，控制台会尝试自动提取 approval_id。</p>
+          <label>Approval ID<input id="approvalId" placeholder="approval id" /></label>
+          <div class="actions">
+            <button id="approveButton" class="button primary">批准请求</button>
+            <button id="copyApprovalToTask" class="button secondary">用于任务重试</button>
+          </div>
+        </section>
+      </section>
+
+      <section id="systemView" class="view">
+        <div class="grid two">
+          <section class="panel">
+            <span class="section-kicker">Health</span>
+            <h3>Runtime 状态</h3>
+            <div class="actions">
+              <button id="loadHealth" class="button primary">/health</button>
+              <button id="loadReady" class="button secondary">/health/ready</button>
+              <button id="loadAgents" class="button secondary">/api/v1/agents</button>
+              <button id="loadRagStatus" class="button secondary">RAG / Demo</button>
+            </div>
+          </section>
+          <section class="panel">
+            <span class="section-kicker">Quick links</span>
+            <h3>开发接口</h3>
+            <div class="quick-links">
+              <a href="/docs" target="_blank" rel="noreferrer">Swagger UI</a>
+              <a href="/redoc" target="_blank" rel="noreferrer">ReDoc</a>
+              <a href="/health" target="_blank" rel="noreferrer">Health</a>
+              <a href="/health/ready" target="_blank" rel="noreferrer">Readiness</a>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="adminView" class="view">
+        <section class="panel admin-hero">
+          <div>
+            <span class="section-kicker">Admin workspace</span>
+            <h3>数据与知识库管理</h3>
+            <p class="muted">仅管理员可访问。所有读写操作都限定在当前租户和店铺。</p>
+          </div>
+          <button id="refreshAdmin" class="button secondary">刷新数据</button>
+        </section>
+
+        <div id="adminNotice" class="notice hidden"></div>
+        <div id="adminStats" class="stats-grid" aria-label="数据库概览"></div>
+
+        <section class="panel admin-section">
+          <div class="panel-head">
+            <div>
+              <span class="section-kicker">Product database</span>
+              <h3>商品数据</h3>
+            </div>
+            <div class="inline-tools">
+              <input id="productSearch" placeholder="搜索 SKU、名称或分类" />
+              <button id="searchProducts" class="button secondary">搜索</button>
+              <button id="newProduct" class="button primary">新增商品</button>
+            </div>
+          </div>
+          <div class="table-wrap admin-table-wrap">
+            <table>
+              <thead><tr><th>SKU</th><th>商品</th><th>分类</th><th>售价</th><th>库存</th><th>补货线</th><th>状态</th><th>操作</th></tr></thead>
+              <tbody id="productRows"><tr><td colspan="8" class="empty-cell">进入管理员页面后加载商品。</td></tr></tbody>
+            </table>
+          </div>
+          <form id="productForm" class="editor hidden">
+            <div class="editor-head"><h4 id="productFormTitle">新增商品</h4><button type="button" id="closeProductForm" class="button ghost">关闭</button></div>
+            <div class="grid three compact">
+              <label>SKU<input id="productSku" required placeholder="例如 HIKE-001" /></label>
+              <label>中文名称<input id="productTitleZh" required /></label>
+              <label>英文名称<input id="productTitleEn" /></label>
+              <label>分类<input id="productCategory" value="general" /></label>
+              <label>售价<input id="productPrice" type="number" min="0" step="0.01" required /></label>
+              <label>成本<input id="productCost" type="number" min="0" step="0.01" /></label>
+              <label>库存<input id="productStock" type="number" min="0" value="0" required /></label>
+              <label>补货线<input id="productReorder" type="number" min="0" value="20" required /></label>
+              <label>状态<select id="productStatus"><option value="active">上架</option><option value="draft">草稿</option><option value="archived">归档</option></select></label>
+              <label>供应商<input id="productSupplier" /></label>
+              <label class="span-two">标签（逗号分隔）<input id="productTags" placeholder="户外, 防水, 热卖" /></label>
+            </div>
+            <label>商品描述<textarea id="productDescription" rows="4"></textarea></label>
+            <button class="button primary" type="submit">保存商品</button>
+          </form>
+        </section>
+
+        <section class="panel admin-section">
+          <div class="panel-head">
+            <div>
+              <span class="section-kicker">Knowledge base</span>
+              <h3>RAG 知识文档</h3>
+            </div>
+            <div class="inline-tools">
+              <input id="ragSearch" placeholder="搜索标题或正文" />
+              <button id="searchRag" class="button secondary">搜索</button>
+              <button id="newRag" class="button primary">新增文档</button>
+            </div>
+          </div>
+          <div class="table-wrap admin-table-wrap">
+            <table>
+              <thead><tr><th>文档</th><th>分类</th><th>语言</th><th>分块</th><th>检索方式</th><th>摘要</th><th>操作</th></tr></thead>
+              <tbody id="ragRows"><tr><td colspan="7" class="empty-cell">进入管理员页面后加载知识库。</td></tr></tbody>
+            </table>
+          </div>
+          <form id="ragForm" class="editor hidden">
+            <div class="editor-head"><h4 id="ragFormTitle">新增知识文档</h4><button type="button" id="closeRagForm" class="button ghost">关闭</button></div>
+            <div class="grid three compact">
+              <label>文档 ID（可选）<input id="ragDocumentId" placeholder="自动生成" /></label>
+              <label>标题<input id="ragTitle" required /></label>
+              <label>分类<input id="ragCategory" value="general" /></label>
+              <label>语言<input id="ragLanguage" value="zh" /></label>
+              <label>关联 SKU<input id="ragSku" value="GENERAL" /></label>
+              <label>生效日期<input id="ragEffectiveDate" type="date" /></label>
+            </div>
+            <label>文档正文<textarea id="ragContent" rows="10" required placeholder="输入政策、产品知识、SOP 或 FAQ 正文"></textarea></label>
+            <p class="hint">保存后系统自动清洗和分块；没有本地向量模型时仍可立即使用关键词检索。</p>
+            <button class="button primary" type="submit">保存文档</button>
+          </form>
+        </section>
+      </section>
+
+      <section class="response panel">
+        <div class="panel-head">
+          <div>
+            <span class="section-kicker">Assistant answer</span>
+            <h3 id="responseTitle">等待你的问题</h3>
+          </div>
+          <div class="response-meta">
+            <span id="responseStatus" class="status neutral">IDLE</span>
+            <span id="responseLatency">—</span>
+          </div>
+        </div>
+        <div id="summaryBox" class="summary-box">结论、关键指标、建议与证据会显示在这里。</div>
+        <div id="resultCards" class="result-cards"></div>
+        <details>
+          <summary>技术详情（证据、路由、SQL 与原始响应）</summary>
+          <pre id="responseJson">{}</pre>
+        </details>
+      </section>
+    </main>
+  </div>
+  <script src="/app/static/app.js" defer></script>
+</body>
+</html>

@@ -1,2 +1,480 @@
-# EcomPilot-Standalone
-跨境电商多智能体运营平台：Text-to-SQL、RAG、商品库存、竞品分析、人工审批与管理后台，支持 Mac Docker 本地运行。
+# 跨境电商多智能体运营矩阵
+
+[简体中文](README.md) | [English](README_EN.md)
+
+## 安全、可解释、可本地运行的 RAG 与 Text-to-SQL 智能运营平台
+
+[![CI](https://github.com/doublebeauty22/EcomPilot-Standalone/actions/workflows/ci.yml/badge.svg)](https://github.com/doublebeauty22/EcomPilot-Standalone/actions/workflows/ci.yml)
+![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-cache-DC382D?logo=redis&logoColor=white)
+
+> 面向跨境电商运营的企业级智能体系统。它把销售分析、商品与库存、竞品监控、知识库问答、客服、社媒文案和高风险审批统一到一个自然语言入口中，并通过确定性路由、受约束 DAG、租户隔离和人工审批保证执行安全。
+
+[功能亮点](#核心亮点) · [快速体验](#5-分钟启动完整本地-demo) · [演示问题](#可以直接这样提问) · [系统架构](#系统架构) · [评估结果](#当前验证状态) · [贡献指南](CONTRIBUTING.md)
+
+## 你可以用它做什么
+
+| 场景 | 用户体验 | 系统能力 |
+|---|---|---|
+| 销售与退款分析 | 直接询问销售额、退款率及变化原因 | 安全 Text-to-SQL + SQL/RAG 联合取证 |
+| 商品、价格与库存 | 查询鞋子、背包的价格、库存和备货建议 | 商品检索、库存预测、连续追问记忆 |
+| 竞品监控 | 对比 Temu、Amazon 等渠道价格 | 多平台价格观测与异常提醒 |
+| 店铺知识问答 | 查询退款、物流、保修和运营制度 | Hybrid RAG + 引用校验 + grounded answer |
+| 运营内容生成 | 生成 TikTok 等平台推广文案 | 平台化模板、品牌语气与中文输出 |
+| 客服辅助 | 根据商品、订单和政策生成客服回复 | CRM 短期记忆 + RAG + 人性化回答 |
+| 高风险操作 | 审批广告暂停、风险订单等写操作 | 参数绑定审批、一次性消费、幂等保护 |
+| 数据管理 | 在管理员界面维护商品和 RAG 文档 | RBAC、租户隔离、可视化增删改查 |
+
+对话默认保留同一会话内的短期记忆，可以接着问“多少钱？”或“那库存呢？”。点击“新对话”会同时清除消息、审批上下文和会话记忆。
+
+## 5 分钟启动完整本地 Demo
+
+Mac 用户可先安装并打开 Docker Desktop，然后运行 `bash scripts/start-mac.command`。脚本自动配置本机密钥、数据库和演示数据，并打开页面；普通重启保留已修改的数据。详见 [Mac 本地体验指南](docs/mac-local-demo.md)。
+
+界面的主入口是自然语言对话；正常使用不需要选择 `task_type`、写 SQL 或 JSON。
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env
+```
+
+在 `.env` 中至少设置本地 PostgreSQL 密码与一个演示 API Key：
+
+```dotenv
+APP_ENV=development
+AUTH_MODE=api_key
+API_KEY=replace-with-a-local-demo-key
+PG_HOST=127.0.0.1
+PG_PORT=5432
+PG_DB=ecom_matrix
+PG_USER=postgres
+PG_PWD=replace-with-local-postgres-password
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+```
+
+启动 PostgreSQL 16 + pgvector 和 Redis 7，然后显式安装演示数据（可重复执行）：
+
+```bash
+python -m ecom_agent_matrix.scripts.bootstrap_demo
+python -m uvicorn ecom_agent_matrix.api.main:app --reload --port 8002
+```
+
+打开 <http://127.0.0.1:8002/app>，填入 API Key，直接提问。默认引导会创建 52 个商品（含背包、鞋类等可连续追问样本）、720 个覆盖 2026 年 1‑9 月的订单、160 条竞品观测、12 条风险记录与 30 份知识文档。无本地 embedding 依赖时会明确运行为 `lexical_only`；要启用混合检索：
+
+```bash
+pip install -e ".[rag-local]"
+python -m ecom_agent_matrix.scripts.bootstrap_demo --with-embeddings
+```
+
+LLM 是可选的：明显意图、SQL 模板、RAG 检索和展示均有确定性降级路径。需要更自然的综合时，在 `.env` 设置已有的 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`，不需要更换架构。
+
+拥有 `admin` 角色的账号可从左侧“管理员”进入数据后台，查看业务数据概览、搜索/新增/编辑/删除商品，并查看、编辑或新增 RAG 知识文档。所有管理员 API 都在服务端校验角色并受租户/店铺 RLS 隔离，不能依靠前端按钮绕过权限。
+
+## 可以直接这样提问
+
+- `2026年8月销售额是多少？`
+- `为什么2026年8月退款率上涨，有没有相关运营事件？`
+- `退款政策是什么？`
+- `帮我找防水户外背包。`
+- `现在店里都有哪些商品？`
+- `哪些商品库存不足，需要优先补货？`
+- `BAG-001 在 Temu 上最近卖多少钱？`
+- `ORD-DEMO-001 现在什么状态？`
+- `目前哪个广告活动 ROAS 最低？`
+- `帮我暂停表现最差的广告活动。`（需审批）
+- `检查一下当前电商数据有没有异常。`
+- `给我生成今天的运营报告。`
+- `给 BAG-001 写一条 TikTok 推广文案。`
+- `客户说 BAG-002 拉链坏了想退款，应该怎么回复？`
+- `把 ORD-DEMO-RISK 标记为高风险订单。`（需审批）
+
+每个入口的真实后端映射见 [演示能力矩阵](docs/demo_capability_matrix.md)。
+
+本项目回答一个核心问题：**当企业用户的复杂业务问题同时涉及结构化数据库、内部文档和业务系统时，Agent 能否安全、准确、可追溯地收集证据并返回 grounded answer？**
+
+系统只注册四个 Runtime Agent。库存、广告、风控、客服、报表等业务能力由 typed Workflow 与 Skill 承载，避免演变成难以治理的“一个功能一个 Agent”。
+
+## 核心亮点
+
+| 能力 | 实现 |
+|---|---|
+| 确定性 Fast Path | 高置信单任务不调用 Planner，直接路由到目标 Agent |
+| Typed DAG | 复杂任务经过步骤上限、依赖、环路和 Agent/task mapping 校验 |
+| Fail-closed 执行 | 未认证身份、越权 Skill、无效审批和不可用 Agent 均显式失败 |
+| Human-in-the-loop | 高风险写操作绑定租户、Skill、精确参数哈希、有效期和一次性消费 |
+| Hybrid RAG | Vector + lexical recall、RRF、batch rerank、citation validation |
+| Safe Text-to-SQL | 权限前置 Schema Linking、函数 allowlist、SQLGlot AST 校验、只读执行 |
+| Query Guard | 表/列白名单、租户 scope、JOIN/列/行上限、statement timeout |
+| SQL Lineage | claim 可追溯到 query ID、SQL、表/列、行数、截断与执行延迟 |
+| Unified Evidence | SQL / Document / API / Computed 统一证据模型与请求内 EvidenceStore |
+| Analytical Planning | Query 内置有界多 SQL 分解，并发执行 trend/category/SKU 分析 |
+| Joint Analysis | Query + RAG 并行取证，区分事实、共现、相关性、假设与未知 |
+| Business API Tools | Query 读适配器与 Exec 受保护写适配器（当前为明确标记的 demo provider） |
+| 多租户隔离 | SecurityContext、PostgreSQL RLS、cache、memory、approval 全链路携带 scope |
+| 可观测性 | 结构化日志、Prometheus 指标、task/correlation tracing、真实 LLM usage |
+| 系统化评估 | Routing、Planning、Safety、Recovery、Execution、RAG 独立评估与报告 |
+
+## 当前验证状态
+
+当前分支已通过：
+
+- 526 个自动化测试（当前 `pytest -q` 实测，并由 GitHub Actions 持续验证）
+- Ruff lint 与 format gate
+- Python compileall
+- 13/13 deterministic routing cases
+- 6/6 typed planning cases
+- 16/16 safety cases
+- 50/50 Enterprise Data Agent deterministic benchmark cases
+- 16/16 Schema Linking、6/6 Analytical Plan、35/35 SQL Safety 对抗、3/3 Evidence 用例
+- 32/32 Gold SQL 实执行用例（validator + PostgreSQL + comparator）
+- 6/6 确定性 Question-to-SQL 实执行用例（question + production service + PostgreSQL）
+- 真实 PostgreSQL Schema Discovery、RLS 租户隔离、只读角色、SQL Repair 和 Analytical Evidence 集成评测通过
+- Docker Compose 配置校验
+
+最新评估输出见 [Agent report](eval/results/latest.json)、[Enterprise report](eval/enterprise/results/latest.json)、[Gold SQL report](eval/enterprise/results/sql_gold_execution.json)、[Question-to-SQL report](eval/enterprise/results/text_to_sql_execution.json) 和 [DB security report](eval/enterprise/results/db_security.json)。依赖外部 LLM 或已填充向量索引的 Level C 指标会明确显示 `NOT_RUN`。
+
+## 系统架构
+
+```mermaid
+flowchart TD
+    Client[Client / Demo] --> API[FastAPI Ingress]
+    API --> Guard[Authentication / RBAC / Rate Limit]
+    Guard --> App[Application Service]
+    App --> Bus[In-process Async MessageBus]
+    Bus --> Master[Master Agent]
+
+    Master --> Fast[Deterministic Fast Path]
+    Master --> Plan[Typed Planner + DAG Validator]
+    Master --> Recover[Bounded Recovery]
+
+    Fast --> Query[Query Agent]
+    Fast --> Exec[Exec Agent]
+    Fast --> RAG[RAG Agent]
+    Plan --> Query
+    Plan --> Exec
+    Plan --> RAG
+
+    Query --> QW[SQL / Data + Read API]
+    Exec --> EW[Command Workflows]
+    RAG --> RS[Hybrid RAGService]
+
+    QW --> SQL[Schema Link + SQLGlot + Read-only Executor]
+    QW --> Skills[SkillExecutor]
+    EW --> Approval[Approval Gate]
+    Approval --> Skills
+
+    Skills --> PG[(PostgreSQL / pgvector)]
+    Skills --> Redis[(Redis)]
+    Skills --> LLM[LLM Provider]
+    Skills --> External[External APIs]
+    RS --> PG
+    RS --> Redis
+    RS --> LLM
+    SQL --> Evidence[Evidence Store]
+    RS --> Evidence
+    External --> Evidence
+    Evidence --> Synthesis[Master Evidence Synthesis]
+    Synthesis --> Grounding[Grounding Check]
+```
+
+主执行链路：
+
+```text
+HTTP API
+  -> Application Service
+  -> Master Orchestrator
+  -> Fast Path / Typed Planner
+  -> Validated DAG Executor
+  -> Query / Exec / RAG
+  -> Typed Workflow
+  -> SkillExecutor
+  -> Security / Approval / Idempotency
+  -> Infrastructure
+```
+
+### 四个 Agent 的职责
+
+| Agent | 职责 | 安全边界 |
+|---|---|---|
+| Master | 路由、规划、DAG 调度、证据聚合、分析综合、有限恢复 | 不直接执行业务 Skill |
+| Query | Text-to-SQL、结构化分析、商品/订单/库存查询、业务 API 读 | 只运行只读能力 |
+| Exec | 广告优化、风控、报表、社媒和客服产物 | 高风险副作用必须经过审批 |
+| RAG | 店铺政策、FAQ、运营知识与商品知识 | 统一进入 `RAGService` |
+
+更多时序图见 [中文架构说明](docs/architecture.md)。
+
+## 企业级 SQL 安全链路
+
+```text
+Question -> permission-filtered Schema Catalog -> Hybrid Schema Linking
+         -> structured SQL generation -> SQLGlot parse/AST validation
+         -> table/column/cost/tenant guards -> read-only transaction + RLS
+         -> result-quality validation -> optional one-shot repair
+         -> SQL evidence + lineage
+```
+
+Schema Catalog 从 PostgreSQL `information_schema` 显式刷新并与静态业务词汇合并；数据库不可用时明确标记 `static_fallback`。Catalog 和 schema embedding 都按版本缓存，不在每次请求中重扫 `information_schema`。
+
+`AppRuntime` 在 DB/Redis 启动后、Agent 启动前加载 Catalog，并将 Runtime 自有的 `SchemaCatalogProvider` 和 `DataIntelligenceService` 注入 Query。本地/演示环境允许显式降级；生产环境中 `static_fallback` 会使 readiness 降级，不会伪装成动态 Catalog 已加载。
+
+Schema Linking 在已配置且本地可用的 embedding provider 上使用 semantic + lexical + alias；默认 CI 不下载模型，因此显式返回 `lexical_only`。自适应阈值、受控 FK 扩展和列级选择会限制生成上下文。
+
+## 为什么同时使用 Fast Path 和 Typed DAG？
+
+简单且高置信的请求走确定性 Fast Path，减少 Planner latency、token cost 和路由随机性。真正的组合任务才进入 Planner，并且模型输出必须先通过 typed policy validation，不能直接成为执行指令。
+
+ReAct 只用于有界恢复，不是默认执行模式。写操作不会因为模型建议而盲目重试。Clarification 被视为成功的控制面交互；超时、Agent 不可用、部分完成和等待审批不会计为完整业务成功。
+
+## 安全与人工审批
+
+代码负责认证、授权、审批和执行状态；LLM 只负责不确定规划与语言生成。
+
+高风险操作遵循以下状态流：
+
+```text
+risky request
+  -> protected Skill
+  -> no valid approval
+  -> success=false
+  -> status=awaiting_approval
+  -> error_code=APPROVAL_REQUIRED
+  -> authenticated approval of exact parameters
+  -> consume approval once
+  -> execute side effect once
+```
+
+审批绑定 tenant、store、requester、Skill 和精确参数哈希，并具有过期时间与一次性消费语义。用户 payload 或 LLM 输出不能伪造 `SecurityContext`，也不能自行批准写操作。
+
+## Hybrid RAG
+
+`RAGService` 独立执行 vector 与 lexical recall，通过 Reciprocal Rank Fusion 合并候选，只进行一次 bounded batch rerank，随后验证 citation 与 grounding 状态。
+
+当 LLM 不可用时，系统可以返回确定性的 source-context fallback；当某个召回通道失败时，会报告 degraded retrieval，而不是伪装成完整成功。统一评估保留 HitRate、Recall、MRR 和 nDCG，不使用未经运行的数据做质量宣传。
+
+## 快速启动
+
+### 方案 A：Docker Compose
+
+要求：Docker 与 Docker Compose。
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少设置 API_KEY 和 PostgreSQL 密码
+
+docker compose -f ecom_agent_matrix/docker/docker-compose.yml up --build -d
+curl http://127.0.0.1:8002/health
+curl http://127.0.0.1:8002/health/ready
+```
+
+启动后可访问：
+
+- Swagger UI：<http://127.0.0.1:8002/docs>
+- ReDoc：<http://127.0.0.1:8002/redoc>
+- Health：<http://127.0.0.1:8002/health>
+- Readiness：<http://127.0.0.1:8002/health/ready>
+- Metrics：<http://127.0.0.1:8002/metrics>
+
+默认镜像是 lean API runtime，不包含 Torch/SentenceTransformer。需要完整本地 RAG Demo 时显式构建 `rag-local` 镜像：
+
+```bash
+INSTALL_RAG_LOCAL=1 docker compose \
+  -f ecom_agent_matrix/docker/docker-compose.yml up --build -d
+
+docker compose -f ecom_agent_matrix/docker/docker-compose.yml exec api \
+  python -m ecom_agent_matrix.scripts.reembed_vectors --only goods
+```
+
+第一次生成向量可能下载 `BAAI/bge-small-en-v1.5`。PostgreSQL 初始化 SQL 只会在数据卷为空时自动执行；应用启动不会静默修改已有生产数据库。
+
+### 方案 B：本地 Python
+
+要求：Python 3.11+、Redis 7、PostgreSQL 16 与 `pgvector`。
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env
+```
+
+如需本地 embedding/reranking：
+
+```bash
+pip install -e ".[rag-local]"
+```
+
+初始化数据库并启动 API：
+
+```bash
+python -m ecom_agent_matrix.scripts.init_db
+python -m ecom_agent_matrix.scripts.reembed_vectors --only goods  # 仅完整 RAG Demo 需要
+uvicorn ecom_agent_matrix.api.main:app --host 0.0.0.0 --port 8002
+```
+
+## 最小 API 示例
+
+```bash
+curl -sS http://127.0.0.1:8002/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-local-demo-key" \
+  -d '{
+    "query": "帮我找防水户外背包。"
+  }'
+```
+
+完整演示覆盖五条安全路径：
+
+1. 安全 Text-to-SQL
+2. SQL + RAG 联合分析
+3. 业务 API 只读查询
+4. 危险 SQL 执行前拒绝
+5. 人工审批与幂等保护
+
+可复制请求、审批 Header 和响应字段说明见 [演示指南](docs/demo.md)。也可以运行覆盖四种 Runtime 模式的 Smoke Runner：
+
+```bash
+export DEMO_API_KEY=your-local-demo-key
+python -m ecom_agent_matrix.scripts.smoke_e2e --transport http --mode fast-path --api-key "$DEMO_API_KEY"
+python -m ecom_agent_matrix.scripts.smoke_e2e --transport http --mode rag --api-key "$DEMO_API_KEY"
+python -m ecom_agent_matrix.scripts.smoke_e2e --transport http --mode composite --api-key "$DEMO_API_KEY"
+python -m ecom_agent_matrix.scripts.smoke_e2e --transport http --mode risk --api-key "$DEMO_API_KEY"
+```
+
+## 智能运营控制台
+
+API 启动后直接打开：
+
+```text
+http://127.0.0.1:8002/app
+```
+
+这个同源前端直接调用现有 FastAPI 网关，不引入第二套 Agent 逻辑。它提供：
+
+- 通用任务控制台：可选择或自动识别所有受支持的 `task_type`
+- Customer / RAG：知识问答与订单查询
+- Competitor：竞品监控，可选 Master 或直达 Query
+- Human Approval：识别 `APPROVAL_REQUIRED` 后审批，并携带 `X-Approval-Id` 重试
+- System：health、readiness、Agent/Skill registry 与 Swagger/ReDoc 快捷入口
+- API Key / JWT 两种鉴权输入；凭证只保存在当前浏览器标签页的 `sessionStorage`
+
+前端是现有 Runtime 的操作面板。所有任务仍然经过既有的认证、RBAC、Master 路由、Query/Exec/RAG、SQL Safety、Approval 和 SkillExecutor 安全边界。
+
+## Agent 评估体系
+
+pytest 验证代码正确性；Evaluation Harness 衡量 Agent 的可观察行为。
+
+```bash
+python -m eval.runner --suite routing
+python -m eval.runner --suite deterministic --fail-on-regression
+python -m eval.runner --suite all
+python -m eval.enterprise.runner --suite all --fail-on-regression
+python -m eval.enterprise.advanced_runner --suite all --fail-on-regression
+python -m eval.enterprise.live_sql.runner --require-postgres --fail-on-regression
+python -m eval.enterprise.live_sql.text_to_sql_runner --require-postgres --fail-on-regression
+python -m eval.enterprise.live_sql.db_integration_runner --require-postgres --fail-on-regression
+```
+
+评估维度：
+
+- Routing：accuracy、Fast Path precision/recall、clarification、无效路由
+- Planning：parse、policy validity、cycle、dependency、Agent/task mapping
+- Execution：task/workflow/Skill success、timeout、latency、LLM usage 与 cost
+- Safety：越权执行、审批合规、重复副作用和租户隔离
+- Recovery：有界恢复、degraded success、unsafe retry、recovery LLM calls
+- RAG：HitRate、Recall、MRR、nDCG、citation validity 与 grounding
+- SQL：parse/safety pass、table/column precision/recall、unsafe SQL rate
+- Enterprise：SQL、RAG、SQL+RAG、API、permission 与 safety 共 50 个用例
+
+当前确定性实测：
+
+| Metric | Result |
+|---|---:|
+| Table Precision / Recall / F1 | 0.979167 / 1.0 / 0.989474 |
+| Column Precision / Recall / F1 | 0.885417 / 1.0 / 0.939227 |
+| SQL Parse Valid / Safety Pass | 1.0 / 1.0 |
+| Analytical Plan Validity | 1.0 |
+| Grounding Pass Rate | 1.0 |
+| Unsafe SQL Execution Rate | 0.0 |
+| Enterprise Cases | 50/50 |
+| Gold SQL Execution Accuracy | 1.0（32/32） |
+| Text-to-SQL Generation Success | 1.0（6/6） |
+| Text-to-SQL Execution Accuracy | 1.0（6/6） |
+| Tenant Isolation Failure Rate | 0.0 |
+| DB Read-only Bypass Rate | 0.0 |
+| RAG Live Eval | NOT_RUN（无已填充向量索引） |
+
+报告写入 `eval/results/latest.json` 和 `eval/results/latest.md`，并严格区分 `PASS`、`FAIL`、`DEGRADED` 与 `NOT_RUN`。
+
+## 开发与质量门
+
+```bash
+python -m compileall -q ecom_agent_matrix eval
+ruff check ecom_agent_matrix test eval
+ruff format --check ecom_agent_matrix test eval
+pytest -q
+python -m eval.runner --suite deterministic --fail-on-regression
+python -m eval.enterprise.runner --suite all --fail-on-regression
+python -m eval.enterprise.advanced_runner --suite all --fail-on-regression
+```
+
+默认 quality CI 不下载 embedding/CrossEncoder 模型，也不依赖外部 API。独立的 `enterprise-sql-integration` job 启动可复现的 PostgreSQL/pgvector service，运行 Gold SQL、Question-to-SQL、Schema Discovery、RLS/只读边界和 Analytical Evidence 评测，并以 `if: always()` 上传三份报告。
+
+确定性 routing benchmark 可单独运行，但它不是端到端性能测试：
+
+```bash
+python -m ecom_agent_matrix.scripts.benchmark_demo -n 100
+```
+
+## 项目结构
+
+```text
+ecom_agent_matrix/
+  api/                 FastAPI ingress and schemas
+  application/         HTTP-independent application boundary
+  agents/              four runtime Agent adapters
+  orchestration/       routing, typed planning, DAG execution, recovery
+  runtime/             lifecycle and in-process async messaging
+  workflows/           typed business orchestration
+  core/                task, security, Skill, approval, LLM contracts
+  infrastructure/      database, Redis, LLM, embedding adapters
+  modules/             data intelligence, evidence, business API, Skills, and RAG
+  platform/            observability and resilience
+  db/                  schemas, RLS migration, database clients
+  scripts/             initialization, indexing, smoke, benchmark
+  docker/              local demo image and Compose environment
+test/                   correctness, contract, security, architecture tests
+eval/                   behavior cases, evaluator, CLI, reports
+docs/                   architecture, demo, observability, interview notes
+```
+
+## 有意保留的架构取舍
+
+- MessageBus 是单进程 asyncio transport，适合当前作品集与 Demo 规模。
+- 不声称已经实现 Kafka、RabbitMQ、Celery 或分布式一致性。
+- 不引入 LangChain、LangGraph、CrewAI 或 AutoGen；核心约束由 typed Python contracts 表达。
+- 全局 singleton 仅作为旧调用兼容入口；活动 Runtime 由 `AppRuntime` 持有并注入依赖。
+- 只有在测量结果证明需要时，才引入 durable transport 或拆分进程。
+
+## 当前限制
+
+- MessageBus、rate limiter、circuit breaker 和 reply registry 是进程内状态。
+- 默认 Docker 镜像不包含本地 Transformer 模型。
+- 完整 RAG 质量评估需要真实填充的向量索引与 ranked results。
+- 当前 Question-to-SQL CI 是 6 个不需外部 LLM 的高置信确定性问句；外部模型泛化评测属于可选 Level C，未运行时为 `NOT_RUN`。
+- Business API provider 当前是本地 demo adapter，不声称已连接生产电商平台。
+- 生产部署仍需要 managed secrets、正式数据库角色/迁移、SLO 和部署平台配置。
+- 仓库不包含虚构的 CD 或未经测量的吞吐量、准确率与成本声明。
+
+## 延伸阅读
+
+- [系统架构](docs/architecture.md) — Fast Path、Typed DAG 与风险审批时序
+- [演示指南](docs/demo.md) — 五条可复制的核心演示路径
+- [可观测性](docs/observability.md) — 日志、指标与链路追踪
+- [设计说明与面试笔记](docs/interview_notes.md) — 架构取舍与常见问题
+- [贡献指南](CONTRIBUTING.md) — 本地开发、测试与提交规范
+- [安全策略](SECURITY.md) — 漏洞报告方式与敏感信息规范

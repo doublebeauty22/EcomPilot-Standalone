@@ -1,0 +1,407 @@
+"""混合检索（BM25 + 向量 RRF），含 Redis 结果缓存。"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import time
+from typing import Dict, List, Optional
+
+from ...config.constants import TABLE_VECTOR_GOODS
+from ...config.settings import settings
+from ...core.logging_config import setup_logger
+from ...db.base import AsyncPGClient
+from ...db.redis_client import AsyncRedisClient
+from ...infrastructure.embedding.provider import (
+    get_text_embedding,
+    resolve_embed_model_name,
+)
+from .formatter import stable_source_id
+from .lexical import lexical_search
+from .rate_limiter import get_rag_semaphore
+from .reranker import rerank_documents_detailed
+from .schemas import HybridRetrievalResult, RetrievalCacheEntry
+from pydantic import ValidationError
+from ...core.security import TenantScope
+
+logger = setup_logger("rag.retriever")
+
+RRF_K = 60
+
+
+class EmbeddingChannelError(RuntimeError):
+    pass
+
+
+def candidate_limit(top_k: int) -> int:
+    return min(max(int(top_k) * 4, 20), 80)
+
+
+def _query_log_fields(query: str) -> dict[str, int | str]:
+    digest = hashlib.sha256((query or "").encode("utf-8")).hexdigest()[:16]
+    return {"query_hash": digest, "query_length": len(query or "")}
+
+
+def _scope_hash(scope: TenantScope | None) -> str:
+    value = f"{scope.tenant_id}:{scope.store_id}" if scope and scope.usable else "legacy"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:20]
+
+
+def _cache_key(
+    query: str,
+    lang: str,
+    price_max: Optional[float],
+    top_k: int,
+    scope: TenantScope | None = None,
+) -> str:
+    payload = json.dumps(
+        {
+            "index_version": settings.RAG_INDEX_VERSION,
+            "retrieval_version": settings.RAG_RETRIEVAL_VERSION,
+            "embedding_model_version": resolve_embed_model_name(),
+            "q": query.strip().lower(),
+            "lang": lang,
+            "price_max": price_max,
+            "top_k": top_k,
+            "scope_hash": _scope_hash(scope),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return (
+        f"rag:retrieve:{settings.RAG_INDEX_VERSION}:"
+        f"{settings.RAG_RETRIEVAL_VERSION}:{_scope_hash(scope)}:{digest}"
+    )
+
+
+async def _load_cache(key: str) -> RetrievalCacheEntry | None:
+    if not settings.RAG_CACHE_ENABLED:
+        return None
+    try:
+        redis = await AsyncRedisClient.get_client()
+        raw = await redis.get(key)
+        if not raw:
+            return None
+        return RetrievalCacheEntry.model_validate_json(raw)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        logger.warning(
+            "rag_cache_decode_failed",
+            extra={"event": "rag_cache_decode_failed", "error_type": type(exc).__name__},
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "rag_cache_read_failed",
+            extra={"event": "rag_cache_read_failed", "error_type": type(exc).__name__},
+        )
+        return None
+
+
+async def _save_cache(key: str, result: HybridRetrievalResult) -> None:
+    if not settings.RAG_CACHE_ENABLED:
+        return
+    try:
+        redis = await AsyncRedisClient.get_client()
+        entry = RetrievalCacheEntry(
+            index_version=settings.RAG_INDEX_VERSION,
+            retrieval_version=settings.RAG_RETRIEVAL_VERSION,
+            embedding_model_version=resolve_embed_model_name(),
+            retrieval_mode=result.mode,
+            degraded=result.degraded,
+            channel_errors=result.channel_errors,
+            candidate_counts=result.candidate_counts,
+            documents=result.raw_documents,
+        )
+        await redis.set(key, entry.model_dump_json(), ex=settings.RAG_CACHE_TTL)
+    except Exception as exc:
+        logger.warning(
+            "rag_cache_write_failed",
+            extra={"event": "rag_cache_write_failed", "error_type": type(exc).__name__},
+        )
+
+
+async def vector_search(
+    query_vec: list[float],
+    lang: str,
+    price_max: float = None,
+    top_k: int = 10,
+    *,
+    scope: TenantScope | None = None,
+) -> List[Dict]:
+    """PGVector 向量相似度检索，支持价格筛选。"""
+    bounded_k = min(max(int(top_k), 1), 80)
+    # aiopg/psycopg2 需要向量字面量字符串，而非 Python list
+    if isinstance(query_vec, list):
+        vec_lit = "[" + ",".join(f"{float(x):.6f}" for x in query_vec) + "]"
+    else:
+        vec_lit = query_vec
+
+    base_sql = f"""
+    SELECT goods_sku, chunk_text, meta_json, embedding <-> %s::vector AS dist
+    FROM {TABLE_VECTOR_GOODS}
+    WHERE embedding IS NOT NULL AND (%s = '' OR lang = %s)
+    """
+    params: list = [vec_lit, lang or "", lang or ""]
+    if scope is not None and scope.usable:
+        base_sql += " AND tenant_id = %s AND store_id = %s"
+        params.extend([scope.tenant_id, scope.store_id])
+    if price_max is not None:
+        base_sql += " AND (meta_json->>'price')::float <= %s"
+        params.append(price_max)
+    base_sql += " ORDER BY dist ASC LIMIT %s;"
+    params.append(bounded_k)
+    res = await AsyncPGClient.execute_read(base_sql, params, scope=scope)
+    return [
+        {
+            "sku": row[0],
+            "chunk_text": row[1],
+            "meta": row[2],
+            "score": 1.0 / (1.0 + float(row[3])),
+            "vector_score": 1.0 / (1.0 + float(row[3])),
+        }
+        for row in res
+    ]
+
+
+def rrf_fuse(vec_list: List[Dict], bm25_list: List[Dict]) -> List[Dict]:
+    rank_map: dict[str, float] = {}
+    for rank, item in enumerate(vec_list):
+        key = stable_source_id(item)
+        rank_map[key] = rank_map.get(key, 0) + 1.0 / (RRF_K + rank + 1)
+    for rank, item in enumerate(bm25_list):
+        key = stable_source_id(item)
+        rank_map[key] = rank_map.get(key, 0) + 1.0 / (RRF_K + rank + 1)
+
+    unique_items: dict[str, dict] = {}
+    for item in vec_list + bm25_list:
+        key = stable_source_id(item)
+        unique_items[key] = {**unique_items.get(key, {}), **dict(item), "source_id": key}
+    for source_id in unique_items:
+        unique_items[source_id] = {
+            **unique_items[source_id],
+            "rrf_score": rank_map[source_id],
+        }
+    return sorted(unique_items.values(), key=lambda x: x["rrf_score"], reverse=True)
+
+
+async def _vector_channel(
+    query: str,
+    lang: str,
+    price_max: float | None,
+    candidate_k: int,
+    scope: TenantScope | None = None,
+) -> tuple[list[dict], float]:
+    started = time.perf_counter()
+    try:
+        sql = f"SELECT EXISTS(SELECT 1 FROM {TABLE_VECTOR_GOODS} WHERE embedding IS NOT NULL"
+        params: list[str] = []
+        if scope is not None and scope.usable:
+            sql += " AND tenant_id=%s AND store_id=%s"
+            params.extend([scope.tenant_id, scope.store_id])
+        sql += ")"
+        ready = await AsyncPGClient.execute_read(sql, params, scope=scope)
+        if ready and not bool(ready[0][0]):
+            raise EmbeddingChannelError("vector index unavailable")
+    except EmbeddingChannelError:
+        raise
+    except Exception:
+        # Unit adapters and legacy stores may not support the readiness probe.
+        pass
+    try:
+        query_vec = await get_text_embedding(query)
+    except Exception as exc:
+        raise EmbeddingChannelError("embedding unavailable") from exc
+    documents = await vector_search(query_vec, lang, price_max, candidate_k, scope=scope)
+    if not documents and lang:
+        documents = await vector_search(query_vec, "", price_max, candidate_k, scope=scope)
+    return documents, (time.perf_counter() - started) * 1000
+
+
+async def _lexical_channel(
+    query: str,
+    lang: str,
+    price_max: float | None,
+    candidate_k: int,
+    scope: TenantScope | None = None,
+) -> tuple[list[dict], float]:
+    started = time.perf_counter()
+    documents = await lexical_search(query, lang, price_max, candidate_k, scope=scope)
+    if not documents and lang:
+        documents = await lexical_search(query, "", price_max, candidate_k, scope=scope)
+    return documents, (time.perf_counter() - started) * 1000
+
+
+async def _hybrid_retrieve_detailed_uncached(
+    query: str,
+    lang: str,
+    price_max: float | None = None,
+    top_k: int = 8,
+    scope: TenantScope | None = None,
+) -> HybridRetrievalResult:
+    started = time.perf_counter()
+    candidate_k = candidate_limit(top_k)
+    vector_call = (
+        _vector_channel(query, lang, price_max, candidate_k)
+        if scope is None
+        else _vector_channel(query, lang, price_max, candidate_k, scope)
+    )
+    lexical_call = (
+        _lexical_channel(query, lang, price_max, candidate_k)
+        if scope is None
+        else _lexical_channel(query, lang, price_max, candidate_k, scope)
+    )
+    vector_outcome, lexical_outcome = await asyncio.gather(
+        vector_call,
+        lexical_call,
+        return_exceptions=True,
+    )
+    errors: dict[str, str] = {}
+    vector_docs: list[dict] = []
+    lexical_docs: list[dict] = []
+    vector_ms = 0.0
+    lexical_ms = 0.0
+    if isinstance(vector_outcome, BaseException):
+        errors["vector"] = (
+            "EMBEDDING_ERROR"
+            if isinstance(vector_outcome, EmbeddingChannelError)
+            else type(vector_outcome).__name__
+        )
+    else:
+        vector_docs, vector_ms = vector_outcome
+    if isinstance(lexical_outcome, BaseException):
+        errors["lexical"] = type(lexical_outcome).__name__
+    else:
+        lexical_docs, lexical_ms = lexical_outcome
+
+    if not vector_docs and lexical_docs and "vector" not in errors:
+        errors["vector"] = "VECTOR_INDEX_EMPTY"
+
+    vector_failed = "vector" in errors
+    lexical_failed = "lexical" in errors
+    if vector_failed and lexical_failed:
+        return HybridRetrievalResult(
+            success=False,
+            mode="none",
+            degraded=True,
+            channel_errors=errors,
+            candidate_counts={"vector": 0, "lexical": 0, "fused": 0, "reranked": 0},
+            diagnostics={
+                "vector_ms": vector_ms,
+                "lexical_ms": lexical_ms,
+                "fusion_ms": 0.0,
+                "rerank_ms": 0.0,
+                "total_ms": (time.perf_counter() - started) * 1000,
+            },
+            latency_ms=(time.perf_counter() - started) * 1000,
+            error_code="RETRIEVAL_ERROR",
+        )
+
+    mode = "hybrid"
+    if vector_failed:
+        mode = "lexical_only"
+    elif lexical_failed:
+        mode = "vector_only"
+    fusion_started = time.perf_counter()
+    fused = rrf_fuse(vector_docs, lexical_docs)
+    fusion_ms = (time.perf_counter() - fusion_started) * 1000
+    rerank_started = time.perf_counter()
+    reranked, rerank_mode = await rerank_documents_detailed(query, fused, top_k)
+    rerank_ms = (time.perf_counter() - rerank_started) * 1000
+    total_ms = (time.perf_counter() - started) * 1000
+    return HybridRetrievalResult(
+        success=True,
+        raw_documents=reranked,
+        mode=mode,
+        degraded=bool(errors),
+        channel_errors=errors,
+        candidate_counts={
+            "vector": len(vector_docs),
+            "lexical": len(lexical_docs),
+            "fused": len(fused),
+            "reranked": len(reranked),
+        },
+        diagnostics={
+            "vector_ms": vector_ms,
+            "lexical_ms": lexical_ms,
+            "fusion_ms": fusion_ms,
+            "rerank_ms": rerank_ms,
+            "total_ms": total_ms,
+            "rerank_mode": rerank_mode,
+        },
+        latency_ms=total_ms,
+    )
+
+
+async def hybrid_retrieve_detailed(
+    query: str,
+    lang: str,
+    price_max: float | None = None,
+    top_k: int = 8,
+    *,
+    task_id: str = "",
+    scope: TenantScope | None = None,
+) -> HybridRetrievalResult:
+    started = time.perf_counter()
+    cache_key = _cache_key(query, lang, price_max, top_k, scope)
+    cached_entry = await _load_cache(cache_key)
+    if cached_entry is not None:
+        elapsed = (time.perf_counter() - started) * 1000
+        return HybridRetrievalResult(
+            success=True,
+            raw_documents=cached_entry.documents,
+            mode=cached_entry.retrieval_mode,
+            degraded=cached_entry.degraded,
+            channel_errors=cached_entry.channel_errors,
+            cached=True,
+            candidate_counts=cached_entry.candidate_counts,
+            diagnostics={"total_ms": elapsed, "rerank_mode": "cached"},
+            latency_ms=elapsed,
+        )
+    sem = get_rag_semaphore()
+    async with sem:
+        result = await _hybrid_retrieve_detailed_uncached(query, lang, price_max, top_k, scope)
+    if result.success:
+        await _save_cache(cache_key, result)
+    logger.info(
+        "rag_retrieve_done",
+        extra={
+            "event": "rag_retrieve_done",
+            "task_id": task_id,
+            **_query_log_fields(query),
+            "lang": lang,
+            "recall_count": len(result.raw_documents),
+            "latency_ms": round(result.latency_ms, 2),
+            "cached": False,
+            "retrieval_mode": result.mode,
+            "degraded": result.degraded,
+        },
+    )
+    return result
+
+
+async def hybrid_retrieve(
+    query: str,
+    lang: str,
+    price_max: float = None,
+    top_k: int = 8,
+    *,
+    task_id: str = "",
+    scope: TenantScope | None = None,
+) -> tuple[list[dict], bool, float]:
+    """
+    混合检索统一入口。
+    返回: (文档列表, 是否命中缓存, 耗时毫秒)
+    """
+    result = await hybrid_retrieve_detailed(
+        query,
+        lang,
+        price_max,
+        top_k,
+        task_id=task_id,
+        scope=scope,
+    )
+    if not result.success:
+        raise RuntimeError("all retrieval channels failed")
+    return result.raw_documents, result.cached, result.latency_ms

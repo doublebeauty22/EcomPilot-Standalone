@@ -1,0 +1,153 @@
+"""Order-risk write workflow."""
+
+from __future__ import annotations
+
+import time
+import re
+
+from pydantic import ValidationError
+from ...platform.observability.metrics import observed_workflow
+
+from ...core.skill.skill_registry import exec_skill
+from ...core.tasking import TaskContext, WorkflowResult, ensure_task_context
+from ...core.errors import ErrorCode
+from ...core.tasking.result import INVALID_REQUEST, SKILL_FAILED
+from ...modules.parsers.risk import parse_risk_request
+
+
+def _metadata(started: float, **extra) -> dict:
+    return {
+        "workflow": "risk",
+        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        **extra,
+    }
+
+
+@observed_workflow("risk")
+async def run_risk_workflow(task: dict | TaskContext) -> WorkflowResult:
+    started = time.perf_counter()
+    ctx = ensure_task_context(task)
+    wants_mark = bool(re.search(r"标记|mark", ctx.query, re.I))
+    if ctx.params.get("total_amount") is None or not (
+        ctx.params.get("buy_count") or ctx.params.get("buy_num")
+    ):
+        match = re.search(r"\bORD[-_][A-Z0-9_-]+\b", ctx.query, re.I)
+        order_no = str(ctx.order_no or (match.group(0) if match else ""))
+        if order_no:
+            lookup = await exec_skill(
+                "business_api_read", {"operation": "get_order", "resource_id": order_no}
+            )
+            fields = (lookup.data or {}).get("fields") or {}
+            items = fields.get("items") or []
+            buy_count = sum(
+                int(item.get("quantity") or 0) for item in items if isinstance(item, dict)
+            )
+            params = dict(ctx.params)
+            params.setdefault("total_amount", fields.get("amount", 0))
+            params.setdefault("buy_count", buy_count or 1)
+            ctx = ctx.with_updates(order_no=order_no, params=params)
+    try:
+        request = parse_risk_request(ctx)
+    except (ValidationError, TypeError, ValueError):
+        return WorkflowResult(
+            success=False,
+            error_code=INVALID_REQUEST,
+            error_msg="风控请求参数不合法",
+            data={"exec_kind": "risk"},
+            metadata=_metadata(started),
+        )
+
+    risk_result = await exec_skill("evaluate_order_risk", request.skill_params())
+    if not risk_result.success:
+        return WorkflowResult(
+            success=False,
+            error_code=SKILL_FAILED,
+            error_msg=risk_result.error_msg or "evaluate_order_risk 失败",
+            data={
+                "exec_kind": "risk",
+                "order_no": request.order_no,
+                "risk": {
+                    "success": False,
+                    "error_code": risk_result.error_code,
+                    "error_msg": risk_result.error_msg,
+                    "data": risk_result.data or {},
+                },
+            },
+            metadata=_metadata(started, skill_error_code=risk_result.error_code),
+        )
+    assessment = risk_result.data or {}
+    record_data = {"skipped": True}
+    if assessment.get("is_risk"):
+        if wants_mark:
+            record_result = await exec_skill(
+                "business_api_write",
+                {
+                    "operation": "mark_order_risk",
+                    "resource_id": request.order_no,
+                    "fields": {"risk_status": "high_risk"},
+                },
+            )
+        else:
+            record_result = await exec_skill(
+                "record_order_risk",
+                {
+                    "order_no": request.order_no,
+                    "risk_type": "order_abnormal",
+                    "risk_desc": assessment.get("risk_detail") or "订单异常",
+                },
+            )
+        record_data = {
+            "skipped": False,
+            "success": record_result.success,
+            "error_code": record_result.error_code,
+            "error_msg": record_result.error_msg,
+            "data": record_result.data or {},
+        }
+        if not record_result.success:
+            approval_required = record_result.error_code == ErrorCode.APPROVAL_REQUIRED
+            approval_id = str((record_result.data or {}).get("approval_id") or "")
+            return WorkflowResult(
+                success=False,
+                error_code=record_result.error_code or ErrorCode.SKILL_FAILED,
+                error_msg=(
+                    "Human approval required"
+                    if approval_required
+                    else record_result.error_msg or "record_order_risk 未完成"
+                ),
+                data={
+                    "exec_kind": "risk",
+                    "order_no": request.order_no,
+                    "risk": {
+                        "success": True,
+                        "error_code": risk_result.error_code,
+                        "error_msg": risk_result.error_msg,
+                        "data": risk_result.data or {},
+                    },
+                    "record": record_data,
+                    "approval_required": approval_required,
+                    "approval_id": approval_id,
+                },
+                metadata=_metadata(started, skill_error_code=record_result.error_code),
+            )
+
+    return WorkflowResult(
+        success=True,
+        data={
+            "exec_kind": "risk",
+            "order_no": request.order_no,
+            "risk": {
+                "success": True,
+                "error_code": risk_result.error_code,
+                "error_msg": risk_result.error_msg,
+                "data": risk_result.data or {},
+            },
+            "record": record_data,
+            "approval_required": False,
+            "approval_id": "",
+        },
+        metadata=_metadata(started),
+    )
+
+
+async def handle_risk(task: dict | TaskContext) -> tuple[bool, str, dict]:
+    return (await run_risk_workflow(task)).as_legacy_tuple()

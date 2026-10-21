@@ -1,0 +1,1035 @@
+"""Master orchestration: fast routing, typed DAG execution and bounded recovery."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+import uuid
+import hashlib
+from typing import Any
+
+from pydantic import BaseModel
+
+from ...config.constants import AGENT_MASTER
+from ...config.settings import settings
+from ...core.logging_config import setup_logger
+from ...core.errors import ErrorCode
+from ...core.tasking import TaskStatus
+from ...core.memory.long_vector_memory import AgentLongVectorMemory
+from ...runtime.messaging.bus import message_bus
+from ...runtime.messaging.message import AgentMessage
+from ...runtime.messaging.reply import build_reply
+from ...runtime.messaging.replies import task_replies
+from ...core.llm.output_polish import polish_final_output
+from ...core.security import (
+    authorize_task,
+    authorize_task_types,
+    security_log_fields,
+    require_trusted_ingress,
+)
+from ...core.security.errors import AuthorizationError
+from ...modules.evidence import (
+    DocumentEvidence,
+    EvidenceStore,
+    SQLEvidence,
+    evidence_synthesis_service,
+)
+from ...platform.observability.context import TraceContext, set_trace_context
+from ...platform.observability.metrics import metrics
+from .executor import MasterPlanExecutor
+from .planner import typed_master_planner
+from .recovery_controller import recovery_controller
+from .recovery import apply_recovery_decision
+from .schemas import PlanExecutionResult
+from .telemetry import MasterLLMTelemetry
+from .router import (
+    MasterRouteDecision,
+    route_master_task,
+)
+
+logger = setup_logger("agent.master")
+
+_master_task_semaphore: asyncio.Semaphore | None = None
+_master_tasks: set[asyncio.Task] = set()
+
+
+class MasterCompletion(BaseModel):
+    """Business outcome returned by the orchestration control plane."""
+
+    success: bool
+    status: TaskStatus
+    error_code: ErrorCode | None = None
+
+
+def _completion(success: bool, error_code: ErrorCode | str | None = None, *, partial=False):
+    typed_code = ErrorCode(error_code) if error_code else None
+    if success:
+        status = TaskStatus.SUCCEEDED
+    elif typed_code == ErrorCode.APPROVAL_REQUIRED:
+        status = TaskStatus.AWAITING_APPROVAL
+    elif partial or typed_code == ErrorCode.PARTIAL_SUCCESS:
+        status = TaskStatus.PARTIAL
+    else:
+        status = TaskStatus.FAILED
+    return MasterCompletion(success=success, status=status, error_code=typed_code)
+
+
+def _get_master_task_semaphore() -> asyncio.Semaphore:
+    global _master_task_semaphore
+    if _master_task_semaphore is None:
+        _master_task_semaphore = asyncio.Semaphore(int(settings.MASTER_MAX_CONCURRENT))
+    return _master_task_semaphore
+
+
+def aggregate_sub_replies(
+    task_id: str, replies: list[AgentMessage], expected: int
+) -> dict[str, Any]:
+    """聚合子 Agent 回传结果。"""
+    sub_results = []
+    for msg in replies:
+        sub_results.append(
+            {
+                "agent": msg.sender,
+                "success": msg.content.get("success", False),
+                "data": msg.content.get("data", {}),
+                "error_msg": msg.content.get("error_msg", ""),
+            }
+        )
+    return {
+        "task_id": task_id,
+        "expected": expected,
+        "received": len(replies),
+        "timed_out": len(replies) < expected,
+        "all_success": len(replies) == expected and all(r["success"] for r in sub_results),
+        "sub_results": sub_results,
+    }
+
+
+def _observation_from_reply(reply: AgentMessage | None, target_agent: str, timed_out: bool) -> dict:
+    if reply is None:
+        return {
+            "agent": target_agent,
+            "success": False,
+            "data": {},
+            "error_msg": "子任务超时无回传",
+            "timed_out": True,
+            "error_code": ErrorCode.AGENT_TIMEOUT.value,
+        }
+    data = reply.content.get("data") or {}
+    return {
+        "agent": reply.sender or target_agent,
+        "success": bool(reply.content.get("success")) and not timed_out,
+        "data": data,
+        "error_msg": reply.content.get("error_msg", ""),
+        "timed_out": timed_out,
+        "error_code": reply.content.get("error_code") or data.get("error_code"),
+        "status": reply.content.get("status") or data.get("status"),
+    }
+
+
+async def _dispatch_subtask(
+    task_id: str,
+    correlation_id: str,
+    target_agent: str,
+    payload: dict,
+    priority: int,
+    security=None,
+    approval=None,
+    *,
+    message_bus_instance=None,
+) -> bool:
+    """向子 Agent 下发单步任务；DAG 并发预算由每个 Executor 拥有。"""
+    clean = {k: v for k, v in payload.items() if k not in ("_memory_context",)}
+    sub_msg = AgentMessage(
+        task_id=task_id,
+        correlation_id=correlation_id,
+        sender=AGENT_MASTER,
+        target=target_agent,
+        priority=priority,
+        content=clean,
+        security=security,
+        approval=approval,
+    )
+    active_bus = message_bus_instance or message_bus
+    delivered = await active_bus.send(sub_msg)
+    if not delivered:
+        return False
+    logger.info(
+        "subtask_dispatched",
+        extra={
+            "event": "subtask_dispatched",
+            "task_id": task_id,
+            "correlation_id": correlation_id,
+            "agent": target_agent,
+        },
+    )
+    return True
+
+
+async def _react_call_one(
+    task_id: str,
+    target_agent: str,
+    payload: dict,
+    priority: int,
+    security=None,
+    approval=None,
+    *,
+    message_bus_instance=None,
+    reply_registry=None,
+) -> dict:
+    """ReAct 单步：下发一个 Agent → 等待回传 → 返回 observation。"""
+    correlation_id = str(uuid.uuid4())
+    active_replies = reply_registry or task_replies
+    active_replies.create(correlation_id)
+    try:
+        if message_bus_instance is not None:
+            delivered = await _dispatch_subtask(
+                task_id,
+                correlation_id,
+                target_agent,
+                payload,
+                priority,
+                security,
+                approval,
+                message_bus_instance=message_bus_instance,
+            )
+        elif security is None and approval is None:
+            delivered = await _dispatch_subtask(
+                task_id, correlation_id, target_agent, payload, priority
+            )
+        elif approval is None:
+            delivered = await _dispatch_subtask(
+                task_id, correlation_id, target_agent, payload, priority, security
+            )
+        else:
+            delivered = await _dispatch_subtask(
+                task_id, correlation_id, target_agent, payload, priority, security, approval
+            )
+        if not delivered:
+            return {
+                "agent": target_agent,
+                "success": False,
+                "data": {"error_code": ErrorCode.AGENT_UNAVAILABLE.value},
+                "error_msg": "Agent is unavailable",
+                "timed_out": False,
+                "error_code": ErrorCode.AGENT_UNAVAILABLE.value,
+            }
+        reply = await active_replies.wait(
+            correlation_id, timeout=float(settings.AGENT_REPLY_TIMEOUT)
+        )
+    finally:
+        active_replies.discard(correlation_id)
+    timed_out = reply is None
+    return _observation_from_reply(reply, target_agent, timed_out)
+
+
+def _existing_summary(data: dict) -> str:
+    """优先复用子 Agent 已生成的面向用户文本。"""
+    for key in ("answer", "summary", "advice"):
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _llm_call_metadata(*, planner: int = 0, react: int = 0, polish: int = 0) -> dict:
+    return {
+        "planner": planner,
+        "react": react,
+        "polish": polish,
+        "total": planner + react + polish,
+    }
+
+
+def _safe_task_descriptor(task_input: dict) -> dict[str, Any]:
+    """仅保留路由/召回必要字段，避免把完整 payload 送入日志或 Memory。"""
+    return {
+        "task_type": str(task_input.get("task_type") or "unknown")[:80],
+        "query": _redact_sensitive_text(
+            str(task_input.get("query") or task_input.get("user_query") or "")
+        )[:500],
+        "sku": str(task_input.get("sku") or task_input.get("target_sku") or "")[:120],
+    }
+
+
+def _redact_sensitive_text(text: str) -> str:
+    value = re.sub(
+        r"(?i)\b(api[_-]?key|token|password|secret)\b\s*[:=]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        str(text or ""),
+    )
+    return re.sub(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]+", "Bearer [REDACTED]", value)
+
+
+def _compat_llm_calls(usage: dict[str, Any]) -> dict[str, int]:
+    """保留 Phase 3A 字段；数据源仅来自真实 Provider telemetry。"""
+    return {
+        "planner": int(usage.get("planner", {}).get("calls", 0)),
+        "react": int(usage.get("recovery", {}).get("calls", 0)),
+        "polish": int(usage.get("polish", {}).get("calls", 0)),
+        "total": int(usage.get("calls", 0)),
+    }
+
+
+def _execution_summary(execution: PlanExecutionResult) -> str:
+    """优先返回最终业务步骤的自然语言结果，避免无意义 polish。"""
+    terminal = list(execution.step_results.values())
+    for result in reversed(terminal):
+        if result.status == "SUCCESS":
+            summary = _existing_summary(result.data)
+            if summary:
+                return summary
+    success_count = sum(item.status == "SUCCESS" for item in terminal)
+    if execution.all_success:
+        return f"任务已完成，{success_count}/{len(terminal)} 个步骤成功。"
+    return f"任务部分完成，{success_count}/{len(terminal)} 个步骤成功。"
+
+
+async def _synthesize_composite_evidence(
+    *,
+    question: str,
+    execution: PlanExecutionResult,
+    security,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Convert bounded Query/RAG outputs to typed evidence, then ground claims."""
+    store = EvidenceStore(tenant_id=security.tenant_id, store_id=security.store_id)
+    for result in execution.step_results.values():
+        if not result.success:
+            continue
+        if result.task_type == "data_analysis":
+            records = list(result.data.get("evidence_records") or [])
+            if not records and isinstance(result.data.get("evidence"), dict):
+                records = [result.data["evidence"]]
+            for record in records:
+                try:
+                    store.add(SQLEvidence.model_validate(record))
+                except (TypeError, ValueError):
+                    continue
+        if result.task_type == "knowledge_qa":
+            for document in list(result.data.get("docs") or [])[:5]:
+                metadata = document.get("meta") or document.get("metadata") or {}
+                source_id = str(document.get("source_id") or metadata.get("document_id") or "")
+                citation_id = str(document.get("citation_id") or "")
+                if not source_id or not citation_id:
+                    continue
+                score = document.get("relevance_score")
+                if score is None:
+                    score = document.get("rrf_score", document.get("score"))
+                confidence = max(0.0, min(float(score), 1.0)) if score is not None else 0.7
+                store.add(
+                    DocumentEvidence(
+                        id=f"doc:{source_id}:{citation_id}",
+                        source_name=str(metadata.get("source") or "enterprise-knowledge-base"),
+                        confidence=confidence,
+                        tenant_id=security.tenant_id,
+                        store_id=security.store_id,
+                        document_id=str(metadata.get("document_id") or source_id),
+                        chunk_id=str(metadata.get("chunk_id") or source_id),
+                        citation_id=citation_id,
+                        content_preview=str(document.get("chunk_text") or "")[:500],
+                        retrieval_score=document.get("rrf_score") or document.get("score"),
+                        rerank_score=document.get("relevance_score"),
+                        metadata={
+                            "document_type": metadata.get("document_type"),
+                            "title": document.get("title") or metadata.get("title"),
+                            "version": metadata.get("version"),
+                            "effective_date": metadata.get("effective_date"),
+                        },
+                    )
+                )
+    analysis = await evidence_synthesis_service.synthesize(question, store)
+    return analysis.model_dump(mode="json"), store.bounded_package()
+
+
+async def _save_plan_memory(
+    long_mem: AgentLongVectorMemory,
+    *,
+    task_type: str,
+    plan: Any,
+    execution: PlanExecutionResult,
+    usage: dict[str, Any],
+    recovery_actions: list[dict[str, Any]] | None = None,
+    security=None,
+) -> None:
+    """Complex plan 仅保存紧凑状态，不持久化 payload/result/reasoning。"""
+    compact = {
+        "task_type": task_type,
+        "plan": {
+            "reason_code": plan.reason_code,
+            "confidence": plan.confidence,
+            "source": plan.planner_source,
+            "steps": [
+                {
+                    "step_id": step.step_id,
+                    "agent": step.agent,
+                    "task_type": step.task_type,
+                    "depends_on": step.depends_on,
+                }
+                for step in plan.steps
+            ],
+        },
+        "step_statuses": {
+            step_id: {
+                "status": result.status,
+                "error_code": result.error_code,
+                "latency_ms": result.latency_ms,
+            }
+            for step_id, result in execution.step_results.items()
+        },
+        "usage": usage,
+        "recovery": {
+            "actions": list(recovery_actions or []),
+            "final_status": "SUCCESS" if execution.all_success else "FAILED",
+        },
+    }
+    await long_mem.safe_save_memory(
+        agent_name=AGENT_MASTER,
+        content=json.dumps(compact, ensure_ascii=False),
+        meta={
+            "task_type": task_type,
+            "mode": "plan",
+            "plan_confidence": plan.confidence,
+            "success": execution.all_success,
+            "verified": False,
+            "deprecated": False,
+        },
+        context=security,
+    )
+
+
+async def _process_complex_plan(
+    msg: AgentMessage,
+    long_mem: AgentLongVectorMemory,
+    route: MasterRouteDecision,
+    task_input: dict[str, Any],
+    started: float,
+    *,
+    message_bus_instance=None,
+    reply_registry=None,
+    planner=None,
+    recovery=None,
+) -> MasterCompletion:
+    active_bus = message_bus_instance or message_bus
+    active_replies = reply_registry or task_replies
+    active_planner = planner or typed_master_planner
+    active_recovery = recovery or recovery_controller
+    telemetry = MasterLLMTelemetry()
+    plan = await active_planner.plan(task_input, telemetry)
+    if plan.decision == "clarify":
+        usage = telemetry.snapshot().model_dump()
+        calls = _compat_llm_calls(usage)
+        result = {
+            "task_id": msg.task_id,
+            "mode": "clarify",
+            "expected": 0,
+            "received": 0,
+            "timed_out": False,
+            "all_success": True,
+            "partial_success": False,
+            "step_results": {},
+            "summary": plan.clarification_question,
+            "plan": plan.model_dump(),
+            "route": route.model_dump(),
+            "master_llm_usage": usage,
+            "master_llm_calls": calls,
+            "metadata": {
+                "master_llm_usage": usage,
+                "master_llm_calls": calls,
+                "master_memory": "skipped_clarify",
+            },
+        }
+        await active_bus.send(
+            build_reply(
+                msg,
+                sender=AGENT_MASTER,
+                success=True,
+                data=result,
+                msg_type="master_task_result",
+                status=TaskStatus.SUCCEEDED.value,
+            )
+        )
+        return _completion(True)
+
+    if msg.security is not None:
+        try:
+            authorize_task_types(msg.security, (step.task_type for step in plan.steps))
+        except AuthorizationError as exc:
+            await active_bus.send(
+                build_reply(
+                    msg,
+                    sender=AGENT_MASTER,
+                    success=False,
+                    data={"error_code": exc.error_code, "task_type": exc.task_type},
+                    error_msg="PERMISSION_DENIED",
+                    msg_type="master_task_result",
+                    status=TaskStatus.FAILED.value,
+                )
+            )
+            return _completion(False, ErrorCode.PERMISSION_DENIED)
+
+    executor = MasterPlanExecutor(
+        message_bus=active_bus,
+        reply_registry=active_replies,
+    )
+    execution = await executor.execute(plan, msg)
+    recovery_actions: list[dict[str, Any]] = []
+    terminal_recovery = None
+    for _ in range(max(0, int(settings.MASTER_RECOVERY_MAX_STEPS))):
+        if execution.all_success:
+            break
+        decision = await active_recovery.run(execution, telemetry)
+        if decision is None:
+            break
+        applied = await apply_recovery_decision(
+            decision,
+            plan=plan,
+            execution=execution,
+            root_message=msg,
+            task_input=task_input,
+            executor=executor,
+            planner=active_planner,
+            telemetry=telemetry,
+        )
+        plan = applied.plan
+        execution = applied.execution
+        terminal_recovery = applied.decision
+        recovery_actions.append(
+            {
+                "action": applied.decision.action,
+                "step_id": applied.decision.step_id,
+                "reason_code": applied.decision.reason_code,
+            }
+        )
+        if applied.decision.action in {"finish", "clarify"}:
+            break
+        if not applied.continue_recovery:
+            break
+
+    summary = ""
+    if terminal_recovery is not None:
+        summary = terminal_recovery.final_answer or terminal_recovery.clarification_question
+    if not summary:
+        summary = _execution_summary(execution)
+
+    analysis = None
+    evidence_package: list[dict[str, Any]] = []
+    if plan.reason_code == "COMPOSITE_DATA_ANALYSIS" and msg.security is not None:
+        analysis, evidence_package = await _synthesize_composite_evidence(
+            question=str(task_input.get("query") or task_input.get("user_query") or ""),
+            execution=execution,
+            security=msg.security,
+        )
+        if analysis["grounding"]["valid"]:
+            summary = analysis["summary"]
+        else:
+            summary = "证据绑定校验未通过，无法安全输出分析结论。"
+
+    usage = telemetry.snapshot().model_dump()
+    calls = _compat_llm_calls(usage)
+    step_results = {step_id: item.model_dump() for step_id, item in execution.step_results.items()}
+    execution_error_code = (
+        None
+        if execution.all_success
+        else ErrorCode.AGENT_TIMEOUT.value
+        if execution.timed_out
+        else next(
+            (
+                item.error_code
+                for item in execution.step_results.values()
+                if item.status == "FAILED" and item.error_code
+            ),
+            ErrorCode.AGENT_FAILED.value,
+        )
+    )
+    completion = _completion(
+        execution.all_success,
+        execution_error_code,
+        partial=execution.partial_success,
+    )
+    result = {
+        "task_id": msg.task_id,
+        "mode": "plan",
+        "expected": len(plan.steps),
+        "received": sum(
+            item.status in {"SUCCESS", "FAILED"} for item in execution.step_results.values()
+        ),
+        "timed_out": execution.timed_out,
+        "all_success": execution.all_success,
+        "partial_success": execution.partial_success,
+        "error_code": execution_error_code,
+        "status": completion.status.value,
+        "step_results": step_results,
+        "sub_results": list(step_results.values()),
+        "summary": summary,
+        "analysis": analysis,
+        "evidence": evidence_package,
+        "plan": plan.model_dump(),
+        "route": route.model_dump(),
+        "recovery": {
+            "attempted": bool(recovery_actions),
+            "actions": recovery_actions,
+            "final_status": "SUCCESS" if execution.all_success else "FAILED",
+        },
+        "master_llm_usage": usage,
+        "master_llm_calls": calls,
+        "metadata": {
+            "master_llm_usage": usage,
+            "master_llm_calls": calls,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        },
+    }
+    await active_bus.send(
+        build_reply(
+            msg,
+            sender=AGENT_MASTER,
+            success=execution.all_success,
+            data=result,
+            error_msg="" if execution.all_success else "部分计划步骤未成功",
+            msg_type="master_task_result",
+            status=completion.status.value,
+        )
+    )
+    try:
+        await _save_plan_memory(
+            long_mem,
+            task_type=str(task_input.get("task_type") or "unknown"),
+            plan=plan,
+            execution=execution,
+            usage=usage,
+            recovery_actions=recovery_actions,
+            security=msg.security,
+        )
+    except Exception as exc:
+        logger.warning(
+            "master_memory_save_failed",
+            extra={
+                "event": "master_memory_save_failed",
+                "task_id": msg.task_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+    return completion
+
+
+async def execute_fast_path(
+    msg: AgentMessage,
+    route: MasterRouteDecision,
+    *,
+    message_bus_instance=None,
+    reply_registry=None,
+) -> dict[str, Any]:
+    """单次 Agent dispatch；不进入 Planner、ReAct 或 Master Memory。"""
+    started = time.perf_counter()
+    telemetry = MasterLLMTelemetry()
+    target_agent = route.target_agents[0]
+    payload = {**dict(msg.content or {}), "task_type": route.task_type}
+    if route.task_type == "goods_catalog":
+        payload["mode"] = "catalog"
+
+    observation = await _react_call_one(
+        msg.task_id,
+        target_agent,
+        payload,
+        msg.priority,
+        msg.security,
+        msg.approval,
+        message_bus_instance=message_bus_instance,
+        reply_registry=reply_registry,
+    )
+    timed_out = bool(observation.get("timed_out"))
+    partial = observation.get("status") == TaskStatus.PARTIAL.value
+    success = bool(observation.get("success")) and not timed_out and not partial
+    summary = _existing_summary(observation.get("data") or {})
+    if not summary and not success:
+        summary = str(observation.get("error_msg") or "任务未能完成。")
+    elif not summary:
+        summary = await polish_final_output(
+            success=success,
+            data=observation.get("data") or {},
+            error_msg=observation.get("error_msg", ""),
+            user_query=str(msg.content.get("query") or msg.content.get("user_query") or ""),
+            reply_from=AGENT_MASTER,
+            prefer_existing_answer=True,
+            on_provider_start=lambda: telemetry.start_call("polish"),
+            on_provider_result=lambda result: telemetry.add_result("polish", result),
+        )
+
+    usage = telemetry.snapshot().model_dump()
+    calls = _compat_llm_calls(usage)
+    return {
+        "task_id": msg.task_id,
+        "mode": "fast_path",
+        "expected": 1,
+        "received": 1 if not timed_out else 0,
+        "timed_out": timed_out,
+        "all_success": success,
+        "partial_success": partial,
+        "error_code": (
+            None
+            if success
+            else ErrorCode.PARTIAL_SUCCESS.value
+            if partial
+            else observation.get("error_code") or ErrorCode.AGENT_FAILED.value
+        ),
+        "sub_results": [
+            {
+                "agent": observation.get("agent") or target_agent,
+                "success": success,
+                "data": observation.get("data") or {},
+                "error_msg": observation.get("error_msg", ""),
+            }
+        ],
+        "summary": summary,
+        "route": route.model_dump(),
+        "master_llm_calls": calls,
+        "master_llm_usage": usage,
+        "metadata": {
+            "master_llm_calls": calls,
+            "master_llm_usage": usage,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "master_memory": "skipped_fast_path",
+        },
+    }
+
+
+async def process_master_task(
+    msg: AgentMessage,
+    long_mem: AgentLongVectorMemory,
+    *,
+    message_bus_instance=None,
+    reply_registry=None,
+    planner=None,
+    recovery=None,
+) -> MasterCompletion:
+    """Route to Fast Path or validated DAG, then apply bounded recovery if needed."""
+    task_id = msg.task_id
+    active_bus = message_bus_instance or message_bus
+    require_trusted_ingress(msg.security, app_env=settings.APP_ENV)
+    started = time.perf_counter()
+    task_input = dict(msg.content or {})
+    task_descriptor = _safe_task_descriptor(task_input)
+
+    logger.info(
+        "master_task_received",
+        extra={
+            "event": "master_task_received",
+            "task_id": task_id,
+            "task_type": task_descriptor["task_type"],
+            "query_hash": hashlib.sha256(task_descriptor["query"].encode("utf-8")).hexdigest()[:16],
+            "query_length": len(task_descriptor["query"]),
+            **security_log_fields(msg.security),
+        },
+    )
+
+    route = route_master_task(task_input)
+    logger.info(
+        "master_route_done",
+        extra={
+            "event": "master_route_done",
+            "task_id": task_id,
+            "mode": route.mode,
+            "task_type": route.task_type or "",
+            "reason_code": route.reason_code,
+            "confidence": route.confidence,
+        },
+    )
+
+    if route.task_type and msg.security is not None:
+        try:
+            authorize_task(msg.security, route.task_type)
+        except AuthorizationError as exc:
+            await active_bus.send(
+                build_reply(
+                    msg,
+                    sender=AGENT_MASTER,
+                    success=False,
+                    data={"error_code": exc.error_code, "task_type": exc.task_type},
+                    error_msg="PERMISSION_DENIED",
+                    msg_type="master_task_result",
+                    status=TaskStatus.FAILED.value,
+                )
+            )
+            return _completion(False, ErrorCode.PERMISSION_DENIED)
+
+    if route.mode == "clarify":
+        clarification = "请说明您要查询的数据、咨询的店铺规则，或需要执行的业务操作。"
+        usage = MasterLLMTelemetry().snapshot().model_dump()
+        calls = _llm_call_metadata()
+        final_result = {
+            "task_id": task_id,
+            "mode": "clarify",
+            "expected": 0,
+            "received": 0,
+            "timed_out": False,
+            "all_success": True,
+            "sub_results": [],
+            "react_trace": [],
+            "summary": clarification,
+            "route": route.model_dump(),
+            "master_llm_usage": usage,
+            "master_llm_calls": calls,
+            "metadata": {
+                "master_llm_usage": usage,
+                "master_llm_calls": calls,
+                "master_memory": "skipped_clarify",
+            },
+        }
+        await active_bus.send(
+            build_reply(
+                msg,
+                sender=AGENT_MASTER,
+                success=True,
+                data=final_result,
+                msg_type="master_task_result",
+                status=TaskStatus.SUCCEEDED.value,
+            )
+        )
+        return _completion(True)
+
+    if route.mode == "fast_path":
+        final_result = await execute_fast_path(
+            msg,
+            route,
+            message_bus_instance=message_bus_instance,
+            reply_registry=reply_registry,
+        )
+        completion = _completion(
+            final_result["all_success"] and not final_result["timed_out"],
+            final_result.get("error_code"),
+            partial=final_result.get("partial_success", False),
+        )
+        final_result["status"] = completion.status.value
+        root_error = next(
+            (
+                str(item.get("error_msg") or "").strip()
+                for item in final_result.get("sub_results") or []
+                if isinstance(item, dict) and not item.get("success") and item.get("error_msg")
+            ),
+            "",
+        )
+        await active_bus.send(
+            build_reply(
+                msg,
+                sender=AGENT_MASTER,
+                success=final_result["all_success"] and not final_result["timed_out"],
+                data=final_result,
+                error_msg=(
+                    root_error
+                    or (
+                        "任务处理超时，请稍后重试。"
+                        if final_result["timed_out"]
+                        else "任务未能完成。"
+                    )
+                    if final_result["timed_out"] or not final_result["all_success"]
+                    else ""
+                ),
+                msg_type="master_task_result",
+                status=completion.status.value,
+            )
+        )
+        return completion
+
+    return await _process_complex_plan(
+        msg,
+        long_mem,
+        route,
+        task_input,
+        started,
+        message_bus_instance=message_bus_instance,
+        reply_registry=reply_registry,
+        planner=planner,
+        recovery=recovery,
+    )
+
+
+async def safe_process_master_task(
+    msg: AgentMessage,
+    long_mem: AgentLongVectorMemory,
+    *,
+    message_bus_instance=None,
+    reply_registry=None,
+    planner=None,
+    recovery=None,
+    semaphore=None,
+) -> MasterCompletion | None:
+    """限制用户级并发，并保证未捕获异常也向 Gateway 回传。"""
+    started = time.perf_counter()
+    success = False
+    set_trace_context(
+        TraceContext.from_identity(
+            task_id=msg.task_id,
+            correlation_id=msg.correlation_id,
+            agent_id=AGENT_MASTER,
+            tenant_id=getattr(msg.security, "tenant_id", ""),
+            user_id=getattr(msg.security, "user_id", ""),
+        )
+    )
+    try:
+        active_semaphore = semaphore or _get_master_task_semaphore()
+        async with active_semaphore:
+            if all(
+                dependency is None
+                for dependency in (message_bus_instance, reply_registry, planner, recovery)
+            ):
+                completion = await process_master_task(msg, long_mem)
+            else:
+                completion = await process_master_task(
+                    msg,
+                    long_mem,
+                    message_bus_instance=message_bus_instance,
+                    reply_registry=reply_registry,
+                    planner=planner,
+                    recovery=recovery,
+                )
+            success = bool(completion and completion.success)
+            return completion
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "master_task_failed",
+            extra={
+                "event": "master_task_failed",
+                "task_id": msg.task_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        failure = {
+            "task_id": msg.task_id,
+            "mode": "master_error",
+            "expected": 0,
+            "received": 0,
+            "timed_out": False,
+            "all_success": False,
+            "error_code": ErrorCode.INTERNAL_ERROR.value,
+            "sub_results": [],
+            "summary": "master task failed",
+            "master_llm_usage": MasterLLMTelemetry().snapshot().model_dump(),
+            "master_llm_calls": _llm_call_metadata(),
+            "metadata": {"master_llm_calls": _llm_call_metadata()},
+        }
+        try:
+            active_bus = message_bus_instance or message_bus
+            await active_bus.send(
+                build_reply(
+                    msg,
+                    sender=AGENT_MASTER,
+                    success=False,
+                    data=failure,
+                    error_msg="master task failed",
+                    msg_type="master_task_result",
+                    status=TaskStatus.FAILED.value,
+                )
+            )
+        except Exception as reply_exc:
+            logger.error(
+                "master_failure_reply_failed",
+                extra={
+                    "event": "master_failure_reply_failed",
+                    "task_id": msg.task_id,
+                    "error_type": type(reply_exc).__name__,
+                },
+            )
+    finally:
+        metrics.observe_agent(AGENT_MASTER, success, time.perf_counter() - started)
+
+
+def _consume_master_task(task: asyncio.Task) -> None:
+    """移除并消费后台任务结果，避免未检索异常告警。"""
+    _master_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is not None:
+        logger.error(
+            "master_background_task_error",
+            extra={
+                "event": "master_background_task_error",
+                "error_type": type(error).__name__,
+            },
+        )
+
+
+def _track_master_task(
+    msg: AgentMessage,
+    long_mem: AgentLongVectorMemory,
+) -> asyncio.Task:
+    task = asyncio.create_task(safe_process_master_task(msg, long_mem))
+    _master_tasks.add(task)
+    task.add_done_callback(_consume_master_task)
+    return task
+
+
+async def cancel_master_tasks() -> None:
+    """Cancel and consume every Master-owned background request during shutdown."""
+    tasks = list(_master_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class MasterOrchestrator:
+    """Application control plane; owns routing, planning and recovery policy."""
+
+    def __init__(
+        self,
+        long_memory: AgentLongVectorMemory | None = None,
+        *,
+        message_bus_instance=message_bus,
+        reply_registry=task_replies,
+        planner=typed_master_planner,
+        recovery=recovery_controller,
+    ) -> None:
+        self.long_memory = long_memory or AgentLongVectorMemory()
+        self.message_bus = message_bus_instance
+        self.reply_registry = reply_registry
+        self.planner = planner
+        self.recovery = recovery
+        self._semaphore = asyncio.Semaphore(int(settings.MASTER_MAX_CONCURRENT))
+        self._tasks: set[asyncio.Task] = set()
+
+    async def run(self, message: AgentMessage) -> MasterCompletion | None:
+        return await safe_process_master_task(
+            message,
+            self.long_memory,
+            message_bus_instance=self.message_bus,
+            reply_registry=self.reply_registry,
+            planner=self.planner,
+            recovery=self.recovery,
+            semaphore=self._semaphore,
+        )
+
+    def submit(self, message: AgentMessage) -> asyncio.Task:
+        task = asyncio.create_task(self.run(message))
+        self._tasks.add(task)
+        task.add_done_callback(self._consume_task)
+        return task
+
+    def _consume_task(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def close(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+__all__ = [
+    "MasterCompletion",
+    "MasterOrchestrator",
+    "aggregate_sub_replies",
+    "cancel_master_tasks",
+    "execute_fast_path",
+    "process_master_task",
+    "safe_process_master_task",
+]

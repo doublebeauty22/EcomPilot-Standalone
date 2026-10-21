@@ -1,0 +1,59 @@
+# Local Mac demo. The API is only reachable from this computer.
+# Start with: bash scripts/start-mac.command
+services:
+  api:
+    build:
+      context: .
+      dockerfile: ecom_agent_matrix/docker/Dockerfile
+    env_file:
+      - .env.local
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: postgres
+      PG_DB: ecom_matrix
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ""
+    ports:
+      - "127.0.0.1:${ECOMPILOT_PORT:-8002}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read()"]
+      interval: 5s
+      timeout: 6s
+      retries: 24
+      start_period: 30s
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_PWD:?Run scripts/start-mac.command first}
+      POSTGRES_DB: ecom_matrix
+    volumes:
+      - local_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecom_matrix"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - local_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  local_pgdata:
+  local_redis:
